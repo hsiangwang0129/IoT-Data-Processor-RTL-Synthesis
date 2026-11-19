@@ -37,6 +37,10 @@ module IOTDF (
   wire [55:0] pc1_key;
   wire [27:0] key_left_initial;
   wire [27:0] key_right_initial;
+  wire decrypt_mode;
+  wire decrypt_shift_one;
+  wire [27:0] key_left_decrypt_next;
+  wire [27:0] key_right_decrypt_next;
   wire shift_one;
   wire [27:0] key_left_rotated;
   wire [27:0] key_right_rotated;
@@ -63,6 +67,16 @@ module IOTDF (
   assign key_left_initial = pc1_key[55:28];
   assign key_right_initial = pc1_key[27:0];
 
+    assign decrypt_mode = (fn_sel == 3'd2);
+    assign decrypt_shift_one = (round_number == 5'd1) ||
+      (round_number == 5'd8) || (round_number == 5'd15);
+    assign key_left_decrypt_next = decrypt_shift_one
+      ? {key_left[0], key_left[27:1]}
+      : {key_left[1:0], key_left[27:2]};
+    assign key_right_decrypt_next = decrypt_shift_one
+      ? {key_right[0], key_right[27:1]}
+      : {key_right[1:0], key_right[27:2]};
+
   assign shift_one = (round_number == 5'd1) ||
       (round_number == 5'd2) ||
       (round_number == 5'd9) ||
@@ -73,7 +87,9 @@ module IOTDF (
   assign key_right_rotated = shift_one
       ? {key_right[26:0], key_right[27]}
       : {key_right[25:0], key_right[27:26]};
-  assign round_key = des_pc2({key_left_rotated, key_right_rotated});
+    assign round_key = des_pc2(decrypt_mode
+      ? {key_left, key_right}
+      : {key_left_rotated, key_right_rotated});
 
   assign expanded_right = des_expand(right_reg);
   assign mixed_right = expanded_right ^ round_key;
@@ -111,7 +127,7 @@ module IOTDF (
       valid <= 1'b0;
       case (state)
         WAIT_DATA: begin
-          if (in_en && (fn_sel == 3'd1)) begin
+          if (in_en && ((fn_sel == 3'd1) || (fn_sel == 3'd2))) begin
             data_buf[(byte_count*8)+:8] <= iot_in;
             if (byte_count == 4'd14) busy <= 1'b1;
             if (byte_count == 4'd15) begin
@@ -136,8 +152,15 @@ module IOTDF (
           state <= ROUND;
         end
         ROUND: begin
-          key_left  <= key_left_rotated;
-          key_right <= key_right_rotated;
+          if (decrypt_mode) begin
+            if (round_number != 5'd16) begin
+              key_left <= key_left_decrypt_next;
+              key_right <= key_right_decrypt_next;
+            end
+          end else begin
+            key_left <= key_left_rotated;
+            key_right <= key_right_rotated;
+          end
           left_reg  <= right_reg;
           right_reg <= left_reg ^ f_result;
           if (round_number == 5'd16) state <= OUTPUT;
