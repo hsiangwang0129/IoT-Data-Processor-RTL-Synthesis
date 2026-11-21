@@ -18,9 +18,25 @@ module IOTDF (
   output reg valid;
   output reg [127:0] iot_out;
 
-  localparam [2:0] WAIT_DATA = 3'd0, LOAD_INPUT = 3'd1, INIT = 3'd2, ROUND = 3'd3, OUTPUT = 3'd4;
+  localparam [4:0] WAIT_DATA = 5'd0,
+                   LOAD_INPUT = 5'd1,
+                   INIT = 5'd2,
+                   ROUND = 5'd3,
+                   OUTPUT = 5'd4,
+                   F3_CUM_INIT = 5'd5,
+                   F3_CUM_BUILD = 5'd6,
+                   F3_ENCODE_INIT = 5'd7,
+                   F3_UPDATE_INTERVAL = 5'd8,
+                   F3_RENORMALIZE = 5'd9,
+                   F3_EMIT_BASE = 5'd10,
+                   F3_EMIT_PENDING = 5'd11,
+                   F3_NEXT_SYMBOL = 5'd12,
+                   F3_FINALIZE = 5'd13,
+                   F3_PAD = 5'd14,
+                   F3_OUTPUT = 5'd15,
+                   F3_BLOCK_DONE = 5'd16;
 
-  reg [2:0] state;
+  reg [4:0] state;
   reg [3:0] byte_count;
   reg [4:0] round_number;
   reg [127:0] data_buf;
@@ -30,6 +46,28 @@ module IOTDF (
   reg [31:0] right_reg;
   reg [27:0] key_left;
   reg [27:0] key_right;
+
+  reg [1023:0] f3_input_buf;
+  reg [1023:0] encoded_buf;
+  reg [6:0] byte_index;
+  reg [8:0] frequency [0:15];
+  reg [8:0] cumulative [0:16];
+  reg [3:0] cumulative_index;
+  reg [7:0] symbol_index;
+  reg [15:0] low;
+  reg [15:0] high;
+  reg [10:0] pending_count;
+  reg [10:0] output_bit_count;
+  reg [2:0] output_word_index;
+  reg emit_bit;
+  integer frequency_index;
+
+  wire [3:0] current_symbol;
+  wire [16:0] range;
+  wire [25:0] lower_product;
+  wire [25:0] upper_product;
+  wire [16:0] lower_offset;
+  wire [16:0] upper_offset;
 
   wire [63:0] ip_block;
   wire [31:0] left_initial;
@@ -59,6 +97,13 @@ module IOTDF (
   wire [31:0] f_result;
   wire [63:0] pre_fp;
   wire [63:0] des_result;
+
+  assign current_symbol = f3_input_buf[(symbol_index * 4) +: 4];
+  assign range = {1'b0, high} - {1'b0, low} + 17'd1;
+  assign lower_product = range * cumulative[current_symbol];
+  assign upper_product = range * cumulative[current_symbol + 5'd1];
+  assign lower_offset = lower_product >> 8;
+  assign upper_offset = upper_product >> 8;
 
   assign ip_block = des_ip(des_block);
   assign left_initial = ip_block[63:32];
@@ -120,6 +165,23 @@ module IOTDF (
       right_reg <= 32'd0;
       key_left <= 28'd0;
       key_right <= 28'd0;
+      f3_input_buf <= 1024'd0;
+      encoded_buf <= 1024'd0;
+      byte_index <= 7'd0;
+      cumulative_index <= 4'd0;
+      symbol_index <= 8'd0;
+      low <= 16'h0000;
+      high <= 16'hFFFF;
+      pending_count <= 11'd0;
+      output_bit_count <= 11'd0;
+      output_word_index <= 3'd0;
+      emit_bit <= 1'b0;
+      for (frequency_index = 0; frequency_index < 16;
+           frequency_index = frequency_index + 1) begin
+        frequency[frequency_index] <= 9'd0;
+        cumulative[frequency_index] <= 9'd0;
+      end
+      cumulative[16] <= 9'd0;
       busy <= 1'b0;
       valid <= 1'b0;
       iot_out <= 128'd0;
@@ -135,6 +197,22 @@ module IOTDF (
               state <= LOAD_INPUT;
             end else begin
               byte_count <= byte_count + 4'd1;
+            end
+          end else if (in_en && (fn_sel == 3'd3)) begin
+            f3_input_buf[(byte_index * 8) +: 8] <= iot_in;
+            if (iot_in[3:0] == iot_in[7:4]) begin
+              frequency[iot_in[3:0]] <= frequency[iot_in[3:0]] + 9'd2;
+            end else begin
+              frequency[iot_in[3:0]] <= frequency[iot_in[3:0]] + 9'd1;
+              frequency[iot_in[7:4]] <= frequency[iot_in[7:4]] + 9'd1;
+            end
+            if (byte_index == 7'd126)
+              busy <= 1'b1;
+            if (byte_index == 7'd127) begin
+              byte_index <= 7'd0;
+              state <= F3_CUM_INIT;
+            end else begin
+              byte_index <= byte_index + 7'd1;
             end
           end
         end
@@ -169,6 +247,115 @@ module IOTDF (
         OUTPUT: begin
           iot_out <= {main_key, des_result};
           valid <= 1'b1;
+          busy <= 1'b0;
+          state <= WAIT_DATA;
+        end
+        F3_CUM_INIT: begin
+          cumulative[0] <= 9'd0;
+          cumulative_index <= 4'd0;
+          state <= F3_CUM_BUILD;
+        end
+        F3_CUM_BUILD: begin
+          cumulative[cumulative_index + 5'd1]
+              <= cumulative[cumulative_index] + frequency[cumulative_index];
+          if (cumulative_index == 4'd15) begin
+            state <= F3_ENCODE_INIT;
+          end else begin
+            cumulative_index <= cumulative_index + 4'd1;
+          end
+        end
+        F3_ENCODE_INIT: begin
+          low <= 16'h0000;
+          high <= 16'hFFFF;
+          symbol_index <= 8'd0;
+          pending_count <= 11'd0;
+          output_bit_count <= 11'd0;
+          output_word_index <= 3'd0;
+          emit_bit <= 1'b0;
+          state <= F3_UPDATE_INTERVAL;
+        end
+        F3_UPDATE_INTERVAL: begin
+          low <= {1'b0, low} + lower_offset;
+          high <= {1'b0, low} + upper_offset - 17'd1;
+          state <= F3_RENORMALIZE;
+        end
+        F3_RENORMALIZE: begin
+          if (high < 16'h8000) begin
+            emit_bit <= 1'b0;
+            low <= {low[14:0], 1'b0};
+            high <= {high[14:0], 1'b1};
+            state <= F3_EMIT_BASE;
+          end else if (low >= 16'h8000) begin
+            emit_bit <= 1'b1;
+            low <= {low[14:0], 1'b0};
+            high <= {high[14:0], 1'b1};
+            state <= F3_EMIT_BASE;
+          end else if ((low >= 16'h4000) && (high < 16'hC000)) begin
+            pending_count <= pending_count + 11'd1;
+            low <= {low[15], low[13:0], 1'b0};
+            high <= {high[15], high[13:0], 1'b1};
+          end else begin
+            state <= F3_NEXT_SYMBOL;
+          end
+        end
+        F3_EMIT_BASE: begin
+          if (output_bit_count < 11'd1024) begin
+            encoded_buf[output_bit_count] <= emit_bit;
+            output_bit_count <= output_bit_count + 11'd1;
+          end
+          state <= F3_EMIT_PENDING;
+        end
+        F3_EMIT_PENDING: begin
+          if (pending_count != 11'd0) begin
+            if (output_bit_count < 11'd1024) begin
+              encoded_buf[output_bit_count] <= ~emit_bit;
+              output_bit_count <= output_bit_count + 11'd1;
+            end
+            pending_count <= pending_count - 11'd1;
+          end else begin
+            state <= F3_RENORMALIZE;
+          end
+        end
+        F3_NEXT_SYMBOL: begin
+          if (symbol_index == 8'd255) begin
+            state <= F3_FINALIZE;
+          end else begin
+            symbol_index <= symbol_index + 8'd1;
+            state <= F3_UPDATE_INTERVAL;
+          end
+        end
+        F3_FINALIZE: begin
+          if (output_bit_count < 11'd1024) begin
+            encoded_buf[output_bit_count] <= 1'b0;
+            output_bit_count <= output_bit_count + 11'd1;
+          end
+          state <= F3_PAD;
+        end
+        F3_PAD: begin
+          if (output_bit_count < 11'd1024) begin
+            encoded_buf[output_bit_count] <= 1'b1;
+            output_bit_count <= output_bit_count + 11'd1;
+          end else begin
+            pending_count <= 11'd0;
+            output_word_index <= 3'd0;
+            state <= F3_OUTPUT;
+          end
+        end
+        F3_OUTPUT: begin
+          iot_out <= encoded_buf[(output_word_index * 128) +: 128];
+          valid <= 1'b1;
+          if (output_word_index == 3'd7) begin
+            state <= F3_BLOCK_DONE;
+          end else begin
+            output_word_index <= output_word_index + 3'd1;
+          end
+        end
+        F3_BLOCK_DONE: begin
+          for (frequency_index = 0; frequency_index < 16;
+               frequency_index = frequency_index + 1) begin
+            frequency[frequency_index] <= 9'd0;
+          end
+          byte_index <= 7'd0;
           busy <= 1'b0;
           state <= WAIT_DATA;
         end
