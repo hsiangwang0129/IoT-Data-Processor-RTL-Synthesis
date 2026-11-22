@@ -34,7 +34,15 @@ module IOTDF (
                    F3_FINALIZE = 5'd13,
                    F3_PAD = 5'd14,
                    F3_OUTPUT = 5'd15,
-                   F3_BLOCK_DONE = 5'd16;
+                   F3_BLOCK_DONE = 5'd16,
+                   F4_DECODE_INIT = 5'd17,
+                   F4_PC_INIT = 5'd18,
+                   F4_PC_DIV = 5'd19,
+                   F4_SEARCH_INIT = 5'd20,
+                   F4_SEARCH_SYMBOL = 5'd21,
+                   F4_UPDATE_INTERVAL = 5'd22,
+                   F4_RENORMALIZE = 5'd23,
+                   F4_NEXT_SYMBOL = 5'd24;
 
   reg [4:0] state;
   reg [3:0] byte_count;
@@ -60,7 +68,18 @@ module IOTDF (
   reg [10:0] output_bit_count;
   reg [2:0] output_word_index;
   reg emit_bit;
+  reg [7:0] f4_byte_index;
+  reg [15:0] code;
+  reg [15:0] code_probability;
+  reg [10:0] next_bit_index;
+  reg [3:0] search_symbol;
+  reg [32:0] divide_dividend;
+  reg [16:0] divide_divisor;
+  reg [16:0] divide_remainder;
+  reg [16:0] divide_quotient;
+  reg [5:0] divide_bit_count;
   integer frequency_index;
+  integer initial_bit_index;
 
   wire [3:0] current_symbol;
   wire [16:0] range;
@@ -68,6 +87,11 @@ module IOTDF (
   wire [25:0] upper_product;
   wire [16:0] lower_offset;
   wire [16:0] upper_offset;
+  wire [16:0] code_distance;
+  wire [17:0] divide_trial;
+  wire [16:0] symbol_lower;
+  wire [16:0] symbol_upper;
+  wire next_code_bit;
 
   wire [63:0] ip_block;
   wire [31:0] left_initial;
@@ -98,12 +122,19 @@ module IOTDF (
   wire [63:0] pre_fp;
   wire [63:0] des_result;
 
-  assign current_symbol = f3_input_buf[(symbol_index * 4) +: 4];
+    assign current_symbol = (fn_sel == 3'd4)
+      ? search_symbol : f3_input_buf[(symbol_index * 4) +: 4];
   assign range = {1'b0, high} - {1'b0, low} + 17'd1;
   assign lower_product = range * cumulative[current_symbol];
   assign upper_product = range * cumulative[current_symbol + 5'd1];
   assign lower_offset = lower_product >> 8;
   assign upper_offset = upper_product >> 8;
+    assign code_distance = {1'b0, code} - {1'b0, low} + 17'd1;
+    assign divide_trial = {divide_remainder, divide_dividend[32]};
+    assign symbol_lower = {cumulative[search_symbol], 8'd0};
+    assign symbol_upper = {cumulative[search_symbol + 5'd1], 8'd0};
+    assign next_code_bit = (next_bit_index < 11'd1024)
+      ? f3_input_buf[next_bit_index] : 1'b1;
 
   assign ip_block = des_ip(des_block);
   assign left_initial = ip_block[63:32];
@@ -176,6 +207,16 @@ module IOTDF (
       output_bit_count <= 11'd0;
       output_word_index <= 3'd0;
       emit_bit <= 1'b0;
+      f4_byte_index <= 8'd0;
+      code <= 16'd0;
+      code_probability <= 16'd0;
+      next_bit_index <= 11'd16;
+      search_symbol <= 4'd0;
+      divide_dividend <= 33'd0;
+      divide_divisor <= 17'd0;
+      divide_remainder <= 17'd0;
+      divide_quotient <= 17'd0;
+      divide_bit_count <= 6'd0;
       for (frequency_index = 0; frequency_index < 16;
            frequency_index = frequency_index + 1) begin
         frequency[frequency_index] <= 9'd0;
@@ -213,6 +254,20 @@ module IOTDF (
               state <= F3_CUM_INIT;
             end else begin
               byte_index <= byte_index + 7'd1;
+            end
+          end else if (in_en && (fn_sel == 3'd4)) begin
+            if (f4_byte_index < 8'd16) begin
+              frequency[f4_byte_index[3:0]] <= {1'b0, iot_in};
+            end else begin
+              f3_input_buf[((f4_byte_index - 8'd16) * 8) +: 8] <= iot_in;
+            end
+            if (f4_byte_index == 8'd142)
+              busy <= 1'b1;
+            if (f4_byte_index == 8'd143) begin
+              f4_byte_index <= 8'd0;
+              state <= F3_CUM_INIT;
+            end else begin
+              f4_byte_index <= f4_byte_index + 8'd1;
             end
           end
         end
@@ -259,7 +314,7 @@ module IOTDF (
           cumulative[cumulative_index + 5'd1]
               <= cumulative[cumulative_index] + frequency[cumulative_index];
           if (cumulative_index == 4'd15) begin
-            state <= F3_ENCODE_INIT;
+            state <= (fn_sel == 3'd4) ? F4_DECODE_INIT : F3_ENCODE_INIT;
           end else begin
             cumulative_index <= cumulative_index + 4'd1;
           end
@@ -356,8 +411,88 @@ module IOTDF (
             frequency[frequency_index] <= 9'd0;
           end
           byte_index <= 7'd0;
+          f4_byte_index <= 8'd0;
           busy <= 1'b0;
           state <= WAIT_DATA;
+        end
+        F4_DECODE_INIT: begin
+          low <= 16'h0000;
+          high <= 16'hFFFF;
+          symbol_index <= 8'd0;
+          output_word_index <= 3'd0;
+          next_bit_index <= 11'd16;
+          for (initial_bit_index = 0; initial_bit_index < 16;
+               initial_bit_index = initial_bit_index + 1) begin
+            code[15 - initial_bit_index] <= f3_input_buf[initial_bit_index];
+          end
+          state <= F4_PC_INIT;
+        end
+        F4_PC_INIT: begin
+          divide_dividend <= {code_distance, 16'd0};
+          divide_divisor <= range;
+          divide_remainder <= 17'd0;
+          divide_quotient <= 17'd0;
+          divide_bit_count <= 6'd0;
+          state <= F4_PC_DIV;
+        end
+        F4_PC_DIV: begin
+          divide_dividend <= {divide_dividend[31:0], 1'b0};
+          if (divide_trial >= {1'b0, divide_divisor}) begin
+            divide_remainder <= divide_trial - {1'b0, divide_divisor};
+            divide_quotient <= {divide_quotient[15:0], 1'b1};
+          end else begin
+            divide_remainder <= divide_trial[16:0];
+            divide_quotient <= {divide_quotient[15:0], 1'b0};
+          end
+          if (divide_bit_count == 6'd32) begin
+            state <= F4_SEARCH_INIT;
+          end else begin
+            divide_bit_count <= divide_bit_count + 6'd1;
+          end
+        end
+        F4_SEARCH_INIT: begin
+          code_probability <= divide_quotient[15:0];
+          search_symbol <= 4'd0;
+          state <= F4_SEARCH_SYMBOL;
+        end
+        F4_SEARCH_SYMBOL: begin
+          if ((symbol_lower <= {1'b0, code_probability}) &&
+              ({1'b0, code_probability} < symbol_upper)) begin
+            encoded_buf[(symbol_index * 4) +: 4] <= search_symbol;
+            state <= F4_UPDATE_INTERVAL;
+          end else if (search_symbol != 4'd15) begin
+            search_symbol <= search_symbol + 4'd1;
+          end
+        end
+        F4_UPDATE_INTERVAL: begin
+          low <= {1'b0, low} + lower_offset;
+          high <= {1'b0, low} + upper_offset - 17'd1;
+          state <= F4_RENORMALIZE;
+        end
+        F4_RENORMALIZE: begin
+          if ((high < 16'h8000) || (low >= 16'h8000)) begin
+            low <= {low[14:0], 1'b0};
+            high <= {high[14:0], 1'b1};
+            code <= {code[14:0], next_code_bit};
+            if (next_bit_index < 11'd1024)
+              next_bit_index <= next_bit_index + 11'd1;
+          end else if ((low >= 16'h4000) && (high < 16'hC000)) begin
+            low <= {low[15], low[13:0], 1'b0};
+            high <= {high[15], high[13:0], 1'b1};
+            code <= {code[15], code[13:0], next_code_bit};
+            if (next_bit_index < 11'd1024)
+              next_bit_index <= next_bit_index + 11'd1;
+          end else begin
+            state <= F4_NEXT_SYMBOL;
+          end
+        end
+        F4_NEXT_SYMBOL: begin
+          if (symbol_index == 8'd255) begin
+            state <= F3_OUTPUT;
+          end else begin
+            symbol_index <= symbol_index + 8'd1;
+            state <= F4_PC_INIT;
+          end
         end
         default: begin
           state <= WAIT_DATA;
